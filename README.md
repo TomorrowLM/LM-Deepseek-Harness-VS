@@ -1,8 +1,12 @@
 # DeepSeek Harness for VS Code
 
+> **LM Custom 本地定制版**：此目录保留 Vithrive 扩展主体，并使用独立扩展 ID `local.deepseek-harness-vscode-lm-custom`。新增通用命令 `dshPanel.sendPluginRequest`，通过独立 Cordis 插件 `dsh-vscode-bridge` 向 DSH 插件转发请求并返回回执；支持多个文件/源码范围引用、源码多选区和文件拖放。引用按顺序追加到草稿末尾，保留已有文字，不会自动发送消息。
+>
+> **LM Custom local fork**: This copy keeps the Vithrive extension and uses the separate extension ID `local.deepseek-harness-vscode-lm-custom`. It adds the generic `dshPanel.sendPluginRequest` command and deploys the standalone Cordis plugin `dsh-vscode-bridge` for multi-file/source references, multiple editor selections, and file drops. References append to the draft and preserve existing text; messages are never submitted automatically.
+
 一个零依赖的 VS Code 扩展，把 **DeepSeek Harness (DSH)** 接入 VS Code 的两种形态：
 
-1. **忠实窗口**：把 DSH 的 Web GUI 原样内嵌到 VS Code 侧边栏 / 辅助侧边栏 / 编辑器标签页，自动检测、启动 DSH 服务——不注入脚本、不改写界面、不拦截交互，不影响你对 DSH 的页面组织、第三方插件装配等任何二次开发行为；
+1. **忠实窗口**：把 DSH 的 Web GUI 内嵌到 VS Code 侧边栏 / 辅助侧边栏 / 编辑器标签页，自动检测并启动 DSH 服务；需要时通过 DSH Cordis 插件为 VS Code 扩展提供通用请求桥接、引用插入和文件拖放能力；
 2. **Copilot 桥接（v0.7.13 起）**：把 DSH 注册为 VS Code 聊天模型——模型选择器里出现 **DeepSeek Harness 下属模型** 条目（`DSH (DeepSeek Harness)` 跟随 DSH 设置里的默认模型，其余条目固定对应 DeepSeek 官方现役模型，条目名随 DeepSeek 模型版本更新），选中即可在 Copilot Chat 里借助 DSH 强大的任务编排与工具调用能力解题。
 
 > **Copilot 桥接不影响「忠实窗口」形态**——它只是为便捷编程而做的功能提升；你不选这些模型条目时，一切与没有桥接功能时完全一样。
@@ -76,7 +80,7 @@
 从 [官网](https://deepseek.com) 下载安装的 **DeepSeek Harness Windows 桌面版**是 Electron 应用，DSH 运行时内嵌在 `app.asar` 里、`dsh` 也不在 PATH 上，所以早期版本会把它误判成「未安装」。v1.0.1 起扩展会自动识别：
 
 - **安装位置**：优先读注册表卸载项的 `InstallLocation`（`HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall`，兼容机器级安装），再兜底常见的 `%LOCALAPPDATA%\Programs\DeepSeek Harness` 等目录；
-- **启动方式**：用桌面版自带的内置 CLI `<安装目录>\resources\runtime\cli\bin\dsh.cmd` 起一个 `dsh web` 实例（默认端口仍是 `dshPanel.port` = 3080），走的仍是 **web profile**——扩展的配套插件（`dsh-drop-caret` / `dsh-webview-clipboard` / `dsh-vscode-file-links`）照常安装并生效；
+- **启动方式**：用桌面版自带的内置 CLI `<安装目录>\resources\runtime\cli\bin\dsh.cmd` 起一个 `dsh web` 实例（默认端口仍是 `dshPanel.port` = 3080），走的仍是 **web profile**——扩展按需部署 `dsh-vscode-bridge`、`dsh-webview-clipboard` 和 `dsh-vscode-file-links`；
 - **认证**：桌面版 CLI 打印的启动链接里同样带令牌，扩展受管认证代理照旧无感完成浏览器认证；
 - **与桌面 App 的关系**：桌面 App 自己的后端固定为 `127.0.0.1:19387` + `desktop` profile，且带浏览器认证（令牌只经 Electron IPC 下发，外部无法复用），因此面板**不接管**桌面 App 正在运行的那个实例，而是用同一个 `~/.dsh` 起一个独立的 web 实例：**会话与凭据共享，插件/界面设置各自独立**——同一个会话在 App 与 VS Code 面板里都能看到；
 - **检测顺序**：`dshPanel.dshCommand`（或 PATH 上的 `dsh`）→ 桌面版内置 CLI → `npx` 缓存；也可把 `dshPanel.dshCommand` 直接填成内置 CLI 的完整路径来强制指定。
@@ -90,24 +94,41 @@
 - **工作区自动对接**：以 VS Code 当前工作区启动 dsh 并注册到 DSH 工作区列表（幂等，不覆盖你在 DSH 里的手动选择）；
 - **远程支持**：Remote-SSH / Dev Containers 下运行于服务器端，自动检测安装服务器端 dsh、经端口转发把面板接入本地 VS Code；
 - 面板按钮：刷新（不打断运行中的任务）/ 重启 dsh web / 在浏览器中打开；字号跟随 `editor.fontSize` 等比缩放（CSS zoom 实现，非整数倍缩放同样清晰）；
-- **发送选中内容 / 拖放文件到 DSH 对话框**（自动安装配套插件 `dsh-drop-caret`）：把文件、文件夹、代码段以 `路径:行号` 引用精确插入对话框光标处——**从 VS Code 资源管理器拖拽直接引用源文件本身**（不产生副本）；从系统文件管理器拖入时浏览器无法取得真实路径，此时才回退为工作区 `.dsh-drop/` 下的内容快照。点击 DSH 对话中的外链在系统浏览器打开（配合 DSH 插件 `dsh-open-links`）。
+- **发送多段选区 / 拖放文件到 DSH 对话框**（自动部署独立 Cordis 插件 `dsh-vscode-bridge`）：源码右键命令把一个或多个选区作为 `路径:行号` 引用追加到草稿；LM Markdown 等扩展也可调用通用命令 `dshPanel.sendPluginRequest`。从 VS Code 文件树拖入时引用原路径；从系统文件管理器拖入时，将文件快照保存到 DSH 会话工作区的 `.dsh-drop/<sessionId>/` 后插入引用。引用追加到输入框末尾，不自动发送。点击 DSH 对话中的外链在系统浏览器打开（配合 DSH 插件 `dsh-open-links`）。
 - **macOS 剪贴板快捷键修复（自动安装配套插件 `dsh-webview-clipboard`）**：修复 macOS 上面板内 ⌘C/⌘V/⌘X 失效的问题——DSH 页面以跨源 iframe 内嵌于 webview 时，浏览器的原生剪贴板默认动作不会发生。插件注入 DSH 页面后拦截这三个键并经 execCommand 显式执行。仅 macOS + 被内嵌时启用，其余环境行为不变。
 - **点击对话里的工作区文件/文件夹链接 → 在 VS Code 资源管理器中定位并打开（自动安装配套插件 `dsh-vscode-file-links`，v1.0.0 起）**：模型回答里的 `src/a.ts`、`docs/` 这类工作区相对路径链接，原本点击后会在 DSH 侧边栏打开；现在在面板内点击会改为在本窗口的**资源管理器**中定位并打开（文件同时打开编辑器，文件夹仅定位）。**前提**：目标必须位于当前 VS Code 打开的工作区内且真实存在——不满足时自动回落到原来的 DSH 侧边栏行为，绝不出现「点了没反应」。详见下文专节。
 
 ### 使用示例：发送选中内容到对话框
 
-拖拽 / 右键发送是 `dsh-drop-caret` 最常用的能力，操作如下：
+拖放与源码引用由 `dsh-vscode-bridge` 处理，操作如下：
 
 1. 在 VS Code 中**框选住代码块 / 文字块**；
 2. **右键**，点击 **「DeepSeek Harness: 发送选中内容到对话框」**：
 
    ![右键菜单：发送选中内容到对话框](media/send-selection-menu.png)
-3. 代码块所在行数的链接（`路径:起始行-结束行`）就会被发送到对话框，插入在当前光标位置：
+3. 代码块所在行数的引用（`路径:起始行-结束行`）会按顺序追加到对话框草稿末尾；多个独立选区会产生多条引用：
 
    ![发送结果出现在 DSH 对话框中](media/send-selection-result.png)
 4. 在 DSH 里直接发送消息即可，模型可通过引用精确定位到代码块所在文件与行号。
 
-> 同样地，也可以把文件 / 文件夹从系统文件管理器或 VS Code 资源管理器**直接拖进**对话框，插入位置同样是拖放点对应的光标位置。
+> 也可以把文件从系统文件管理器或 VS Code 资源管理器拖到 DSH 输入框。文件引用追加到草稿末尾；系统文件管理器拖入的文件内容会保存为会话工作区中的副本。
+
+### 面向其他 VS Code 扩展的通用 DSH 插件桥接
+
+扩展公开 `dshPanel.sendPluginRequest` 命令。调用方传入 DSH Cordis 插件 ID、方法名和载荷，命令会把请求转发到当前可见的 DSH 面板，并等待插件回执。引用插入是 `dsh-vscode-bridge` 暴露的一个方法；其他 DSH 插件也可注册自己的处理器。
+
+```js
+const result = await vscode.commands.executeCommand('dshPanel.sendPluginRequest', {
+  pluginId: 'dsh-vscode-bridge',
+  method: 'insertReferences',
+  payload: {
+    references: [
+      { filePath: 'D:/project/README.md', startLine: 10, endLine: 15 },
+      { filePath: 'D:/project/src/app.ts', startLine: 20, endLine: 24 },
+    ],
+  },
+});
+```
 
 ### 面板相关配置
 
@@ -295,7 +316,7 @@ DSH：用自己的一套 harness（记忆 / 技能 / AGENTS.md / 工具 / agent 
 - 两条能力线：**忠实窗口**（把 DSH Web GUI 原样内嵌到侧边栏 / 编辑器标签页）与 **Copilot 桥接**（把 DSH 注册为 VS Code 聊天模型）——桥接仍在持续跟进 DeepSeek 模型与 dsh 版本演进，遇到不一致会在扩展内明确告警而不是静默降级；
 - 欢迎大家在不同操作系统（Windows / macOS / Linux，以及 Remote-SSH、WSL、Dev Containers 等远程场景）中测试使用；
 - 如遇问题请在 [GitHub Issues](https://github.com/Vithrive/Deepseek-Harness-for-VS-Code/issues) 提出，作者会尽快回复和改进；
-- 再次强调：**Copilot 桥接不影响「忠实窗口」形态**——面板始终忠实呈现 DSH Web GUI，不对页面注入、改写或拦截任何东西，也不干涉你对 DSH 的插件开发与界面定制。（唯二的例外是两个可关闭的配套插件：修复 macOS 剪贴板快捷键的 `dsh-webview-clipboard`，以及把对话里的工作区文件链接改接到 VS Code 资源管理器的 `dsh-vscode-file-links`，两者都由本扩展随包分发、可一键关闭。）
+- 再次强调：**Copilot 桥接不影响「忠实窗口」形态**——面板始终呈现 DSH Web GUI，不改写 DSH 本体。随扩展分发的配套插件包括：修复剪贴板问题的 `dsh-webview-clipboard`、把工作区文件链接定位到 VS Code 的 `dsh-vscode-file-links`，以及将多个行范围引用连续追加到 DSH 草稿的 `dsh-vscode-reference-sync`。
 
 ---
 

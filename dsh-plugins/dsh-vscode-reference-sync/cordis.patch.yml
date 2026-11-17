@@ -1,0 +1,4 @@
+# dsh-vscode-reference-sync bundle patch: register the client-only reference bridge.
+- insert:
+    - id: vscode-reference-sync
+      name: 'dsh-vscode-reference-sync'

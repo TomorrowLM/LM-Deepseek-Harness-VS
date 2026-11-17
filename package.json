@@ -1,9 +1,9 @@
 {
-  "name": "deepseek-harness-vscode",
-  "displayName": "DeepSeek Harness for VSCode",
-  "description": "DeepSeek Harness (DSH) 的 VS Code 接入：侧边栏/标签页忠实呈现 DSH Web GUI 并自动检测启动，不影响用户对 DSH 本身的页面组织、第三方插件装配等二次开发行为；v0.7.13 起把 DSH 注册为 Copilot 聊天模型——模型选择器里出现 DeepSeek Harness 下属模型条目，接收 Copilot 组织好的现成对话、滤除对话内容无关的 prompt、交给 DSH 二次组织、流式回写，旨在利用 DSH 强大的任务编排与工具调用能力，发挥最大性能；v1.0.1 起自动识别官网 Windows 桌面版，用其内置 dsh CLI 启动（无需 npm/Node）；v1.1.0 起在 Remote-WSL / Remote-SSH 面板里用本机浏览器完成 DeepSeek 账号登录；v1.1.1 起面板内复制按钮经宿主剪贴板中继恢复可用",
-  "version": "1.1.1",
-  "publisher": "vithrive",
+  "name": "deepseek-harness-vscode-lm-custom",
+  "displayName": "DeepSeek Harness for VSCode (LM Custom)",
+  "description": "Customizable DeepSeek Harness VS Code integration with a reusable DSH Cordis bridge for multi-reference insertion and file drops. 可复用的 DSH Cordis 桥接支持多引用与文件拖放。",
+  "version": "0.1.5",
+  "publisher": "local",
   "license": "MIT",
   "icon": "media/icon.png",
   "repository": {
@@ -22,6 +22,7 @@
   ],
   "activationEvents": [
     "onView:dsh.webview",
+    "onCommand:dshPanel.sendPluginRequest",
     "onCommand:dshPanel.resetChatMapping",
     "onCommand:dshPanel.chatStatus",
     "onStartupFinished"
@@ -201,6 +202,10 @@
       {
         "command": "dsh.sendSelection",
         "title": "DeepSeek Harness: 发送选中内容到对话框"
+      },
+      {
+        "command": "dshPanel.sendPluginRequest",
+        "title": "DeepSeek Harness: 调用 DSH 插件"
       },
       {
         "command": "dshPanel.resetChatMapping",

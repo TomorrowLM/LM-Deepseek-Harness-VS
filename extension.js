@@ -22,6 +22,8 @@ let dshInvocation = null;
 let dshInvocationAt = 0;
 // 编辑器标签页模式：当前打开的 DSH 标签页 panel（未打开时为 null）。
 let activeTab = null;
+// 等待 DSH WebView 通用插件桥接请求的回执。
+const pendingPluginRequests = new Map();
 // 扩展上下文（globalState 持久化会话映射）。
 let gContext = null;
 // dsh 语言模型提供方（模型选择器里的 DSH (DeepSeek Harness)）是否注册成功。
@@ -530,7 +532,7 @@ async function registerWorkspace() {
     const value = await dshRpc(base, 'workspace.create', { path: getWorkspaceDir() }, 8000);
     return !!value;
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -1758,6 +1760,7 @@ function buildIframeHtml(url, scale, requestedFileLinkMode) {
   var PLUGIN_ID = ${jsonForScript(FILE_LINK_PLUGIN_SOURCE)};
   var OPEN_PLUGIN_ID = ${jsonForScript(OPEN_EXTERNAL_PLUGIN_SOURCE)};
   var CLIPBOARD_PLUGIN_ID = ${jsonForScript(CLIPBOARD_PLUGIN_SOURCE)};
+  var PLUGIN_BRIDGE_ID = ${jsonForScript(VSCODE_BRIDGE_PLUGIN_SOURCE)};
   var FRAME_ORIGIN = ${jsonForScript(origin)};
   var fileLinkMode = ${jsonForScript(fileLinkMode)};
   function frameWindow() {
@@ -1857,6 +1860,28 @@ function buildIframeHtml(url, scale, requestedFileLinkMode) {
       }
       return;
     }
+    if (data.source === PLUGIN_BRIDGE_ID) {
+      // 通用 DSH Cordis 插件回执只接受当前 DSH iframe 发来的消息。
+      if (!fromOurFrame(event)) return;
+      if (data.type === 'plugin-response' && typeof data.requestId === 'string') {
+        var response = {
+          type: 'dsh-plugin-response',
+          requestId: data.requestId.slice(0, 128),
+          ok: data.ok === true
+        };
+        if (data.ok === true) response.result = data.result;
+        else response.error = typeof data.error === 'string' ? data.error.slice(0, 2000) : 'DSH 插件处理失败';
+        try {
+          if (JSON.stringify(response).length > 512 * 1024) {
+            response = { type: 'dsh-plugin-response', requestId: data.requestId.slice(0, 128), ok: false, error: 'DSH 插件回执过大' };
+          }
+        } catch (e) {
+          response = { type: 'dsh-plugin-response', requestId: data.requestId.slice(0, 128), ok: false, error: 'DSH 插件回执无法序列化' };
+        }
+        vscode.postMessage(response);
+      }
+      return;
+    }
     if (data.type === 'dsh-reveal-result' && typeof data.token === 'string') {
       // 扩展宿主的处理结果：转发回 DSH 页面，由插件决定是否回放原始点击。
       postToFrame({ source: HOST_ID, type: 'reveal-result', token: data.token, ok: data.ok === true });
@@ -1874,22 +1899,41 @@ function buildIframeHtml(url, scale, requestedFileLinkMode) {
       var u = data.url;
       // 注意：此处必须写成 \\/\\/ —— 模板字面量会把 \/ 折叠成 /，
       // 若写成 \/\/ 则注入的脚本变成 /^https?:///i，整段内联脚本语法错误，
-      // 导致 insert-selection 消息监听器注册失败（发送选中内容不生效）。
+      // 导致宿主消息监听器注册失败，插件桥接请求也无法转发。
       if (/^https?:\\/\\//i.test(u)) {
         vscode.postMessage({ type: 'dsh-open-link', url: u });
       }
-    } else if (data.type === 'insert-selection') {
-      // 扩展宿主发来的「选中代码」：转发给 DSH iframe，由 dsh-drop-caret 插件插入对话框。
+    } else if (data.type === 'dsh-plugin-request') {
+      // 不解析插件业务载荷，只在 VS Code WebView 与 DSH iframe 间转发请求。
+      var requestId = typeof data.requestId === 'string' ? data.requestId.slice(0, 128) : '';
+      var pluginId = typeof data.pluginId === 'string' ? data.pluginId : '';
+      var method = typeof data.method === 'string' ? data.method : '';
+      var validIdentifier = /^[A-Za-z0-9._:-]{1,128}$/;
+      if (!requestId || !validIdentifier.test(pluginId) || !validIdentifier.test(method)) {
+        vscode.postMessage({ type: 'dsh-plugin-response', requestId: requestId, ok: false, error: 'DSH 插件请求格式无效' });
+        return;
+      }
       try {
         if (!frame || !frame.contentWindow) {
-          vscode.postMessage({ type: 'insert-selection-ack', status: 'no-frame' });
+          vscode.postMessage({ type: 'dsh-plugin-response', requestId: requestId, ok: false, error: 'DSH 页面尚未加载' });
         } else {
-          frame.contentWindow.postMessage(data, '*');
-          vscode.postMessage({ type: 'insert-selection-ack', status: 'forwarded' });
+          var payloadSize = JSON.stringify(data.payload === undefined ? null : data.payload).length;
+          if (payloadSize > 1024 * 1024) {
+            vscode.postMessage({ type: 'dsh-plugin-response', requestId: requestId, ok: false, error: 'DSH 插件请求载荷过大' });
+            return;
+          }
+          frame.contentWindow.postMessage({
+            source: HOST_ID,
+            type: 'plugin-request',
+            requestId: requestId,
+            pluginId: pluginId,
+            method: method,
+            payload: data.payload
+          }, FRAME_ORIGIN);
         }
       } catch (e) {
         try {
-          vscode.postMessage({ type: 'insert-selection-ack', status: 'error' });
+          vscode.postMessage({ type: 'dsh-plugin-response', requestId: requestId, ok: false, error: '无法转发 DSH 插件请求' });
         } catch (e2) { /* ignore */ }
       }
     }
@@ -1910,16 +1954,10 @@ function escapeHtml(s) {
 }
 
 // =====================================================================
-// DSH 配套插件自动安装/管理
-// 架构原因：面板把 DSH Web GUI 内嵌在跨域 iframe 中，扩展（webview 是
-// iframe 的父容器）受安全隔离无法直接操作 DSH 页面内部的输入框。
-// 「拖文件/文件夹/选中代码段插入对话框」必须在 DSH 页面内部由插件接收，
-// 因此扩展自动在 DSH web profile 中补齐配套插件 dsh-drop-caret，
-// 用户只需安装本扩展，无需手动安装 DSH 插件。
+// DSH 配套插件自动安装/管理。
+// VS Code 宿主只提供通用 request/response 中继；引用插入与文件拖放由独立的
+// dsh-vscode-bridge Cordis 插件处理，避免依赖旧的 textarea 定位插件。
 // =====================================================================
-const DSH_PLUGIN_NAME = 'dsh-drop-caret';
-const DSH_PLUGIN_MIN = '0.2.3';
-const NPMJS_REGISTRY = 'https://registry.npmjs.org/';
 // 内置分发的兼容插件（源码在 dsh-plugins/ 目录，随扩展文件直接写入 DSH web profile，
 // 不经 npm）：① macOS 上 DSH 页面被跨源 iframe 内嵌时 ⌘C/⌘V/⌘X 失效；
 // ② 跨平台：面板内 navigator.clipboard.writeText 被 Electron 权限处理器拒绝，
@@ -1934,6 +1972,8 @@ const FILE_LINK_PLUGIN_NAME = 'dsh-vscode-file-links';
 // 浏览器窗口（DeepSeek 账号登录正是这条路径），由插件把链接交给宿主的
 // vscode.env.openExternal，在客户端（如 WSL/Remote 下的 Windows 本机）浏览器打开。
 const OPEN_EXTERNAL_PLUGIN_NAME = 'dsh-vscode-open-external';
+// 可复用的 DSH Cordis 插件：通用宿主桥接、多引用和文件拖放。
+const VSCODE_BRIDGE_PLUGIN_NAME = 'dsh-vscode-bridge';
 // 插件源码所在目录（打包进 .vsix，运行时按单一源头读取，避免模板字面量转义问题）。
 const BUNDLED_PLUGINS_DIR = 'dsh-plugins';
 // DSH 页面（iframe）与 webview 之间的握手 / 转发协议标识。
@@ -1941,6 +1981,7 @@ const VSCODE_HOST_ID = 'dsh-vscode-host';
 const FILE_LINK_PLUGIN_SOURCE = 'dsh-vscode-file-links';
 const OPEN_EXTERNAL_PLUGIN_SOURCE = 'dsh-vscode-open-external';
 const CLIPBOARD_PLUGIN_SOURCE = 'dsh-webview-clipboard';
+const VSCODE_BRIDGE_PLUGIN_SOURCE = 'dsh-vscode-bridge';
 // 文件链接点击行为：资源管理器定位 + 打开文件 / 仅定位 / 不接管（保持 DSH 行为）。
 const FILE_LINK_ACTION_KEY = 'dshPanel.workspaceFileLinkAction';
 const FILE_LINK_ACTIONS = ['revealAndOpen', 'revealOnly', 'off'];
@@ -1953,18 +1994,6 @@ function dshHomeDir() {
 
 function dshWebProfileDir() {
   return path.join(dshHomeDir(), 'profiles', 'web');
-}
-
-/** 简单版本比较：a >= b 返回 >=0，a < b 返回 <0。 */
-function compareVersions(a, b) {
-  const pa = String(a).split('.').map((n) => parseInt(n, 10) || 0);
-  const pb = String(b).split('.').map((n) => parseInt(n, 10) || 0);
-  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-    const da = pa[i] || 0;
-    const db = pb[i] || 0;
-    if (da !== db) return da - db;
-  }
-  return 0;
 }
 
 async function readJsonFile(file) {
@@ -1981,9 +2010,7 @@ async function writeJsonFile(file, obj) {
 
 /**
  * 幂等：确保 profile 的 package.json 声明该插件（dependencies + dsh.profile.bundles）。
- * @param {string|null} versionSpec 依赖版本范围；传 null 表示不写入 dependencies
- *   （用于随扩展内置分发、直接落盘的插件——npm 注册表上没有该包，写进
- *   dependencies 反而会让用户后续 pnpm / dsh plugin add 解析失败）。
+ * @param {string|null} versionSpec 依赖版本范围或 profile 相对的 file: 地址；传 null 表示不写入 dependencies。
  */
 async function ensureProfileDeclaration(profileDir, plugin, versionSpec) {
   const pkgFile = path.join(profileDir, 'package.json');
@@ -1993,7 +2020,7 @@ async function ensureProfileDeclaration(profileDir, plugin, versionSpec) {
   pkg.dsh.profile = pkg.dsh.profile || {};
   pkg.dsh.profile.bundles = pkg.dsh.profile.bundles || [];
   let changed = false;
-  if (versionSpec !== null && !pkg.dependencies[plugin]) {
+  if (versionSpec !== null && pkg.dependencies[plugin] !== versionSpec) {
     pkg.dependencies[plugin] = versionSpec;
     changed = true;
   }
@@ -2002,82 +2029,13 @@ async function ensureProfileDeclaration(profileDir, plugin, versionSpec) {
     changed = true;
   }
   if (changed) await writeJsonFile(pkgFile, pkg);
+  return changed;
 }
 
 /** 读取已安装插件版本；未安装返回 null。 */
 async function installedPluginVersion(profileDir, plugin) {
   const pkg = await readJsonFile(path.join(profileDir, 'node_modules', plugin, 'package.json'));
   return pkg && pkg.version ? pkg.version : null;
-}
-
-/** 用 npm pack 拉取插件并解压到 profile 的 node_modules（不依赖 pnpm）。 */
-async function installPluginViaNpm(profileDir, plugin) {
-  // 安全面守卫：plugin 仅允许内置常量（npm pack/tar 的命令拼接不做通用转义）。
-  if (plugin !== DSH_PLUGIN_NAME) {
-    throw new Error('installPluginViaNpm 仅支持内置插件 ' + DSH_PLUGIN_NAME);
-  }
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-plugin-'));
-  try {
-    const packOut = await new Promise((resolve, reject) => {
-      exec(
-        `npm pack ${plugin} --pack-destination "${tmp}" --registry ${NPMJS_REGISTRY} --json`,
-        { timeout: 180000, windowsHide: true },
-        (err, stdout) => (err ? reject(new Error((stdout || '').trim() || err.message)) : resolve(stdout))
-      );
-    });
-    const parsed = JSON.parse(packOut);
-    const tarball = parsed && parsed[0] && parsed[0].filename ? parsed[0].filename : null;
-    if (!tarball) throw new Error('npm pack 未能解析 tarball 文件名');
-    const extractDir = path.join(tmp, 'extract');
-    await fs.promises.mkdir(extractDir, { recursive: true });
-    await new Promise((resolve, reject) => {
-      exec(`tar -xzf "${path.join(tmp, tarball)}" -C "${extractDir}"`, { timeout: 60000, windowsHide: true }, (err) => (err ? reject(err) : resolve()));
-    });
-    const pkgSrc = path.join(extractDir, 'package');
-    const dest = path.join(profileDir, 'node_modules', plugin);
-    await fs.promises.rm(dest, { recursive: true, force: true });
-    await fs.promises.cp(pkgSrc, dest, { recursive: true });
-    return true;
-  } finally {
-    fs.rmSync(tmp, { recursive: true, force: true });
-  }
-}
-
-/** 尝试用官方 dsh plugin add 安装（依赖 dsh + pnpm；桌面版则用其自带 pnpm）；成功返回 true。 */
-function tryDshPluginAdd(plugin) {
-  // 安全面守卫：plugin 仅允许内置常量（win32 经 shell 拼接）。
-  if (plugin !== DSH_PLUGIN_NAME) {
-    return Promise.resolve(false);
-  }
-  return new Promise((resolve) => {
-    // 用已解析的启动方式（PATH 上的 dsh / 官网桌面版内置 CLI / npx）：桌面版用户
-    // 没有全局 dsh，写死 'dsh.cmd' 会让配套插件永远装不上。
-    const inv = dshInvocation || { cmd: process.platform === 'win32' ? 'dsh.cmd' : 'dsh', prefix: [] };
-    const env = Object.assign({}, process.env, {
-      // npm 全局 bin 前置，避开旧 corepack shim 干扰 pnpm
-      Path: path.join(os.homedir(), 'AppData', 'Roaming', 'npm') + path.delimiter + (process.env.Path || process.env.PATH || ''),
-      npm_config_registry: NPMJS_REGISTRY
-    });
-    const child = spawn(shellCommandText(inv.cmd), [...inv.prefix, 'plugin', '--profile', 'web', 'add', plugin], {
-      stdio: 'ignore',
-      env,
-      windowsHide: true,
-      shell: process.platform === 'win32'
-    });
-    let done = false;
-    const finish = (ok) => {
-      if (!done) {
-        done = true;
-        resolve(ok);
-      }
-    };
-    child.on('error', () => finish(false));
-    child.on('exit', (code) => finish(code === 0));
-    setTimeout(() => {
-      try { child.kill(); } catch (_) { /* noop */ }
-      finish(false);
-    }, 180000);
-  });
 }
 
 /**
@@ -2090,6 +2048,9 @@ function tryDshPluginAdd(plugin) {
 function readBundledPluginFiles(name) {
   const base = path.join(__dirname, BUNDLED_PLUGINS_DIR, name);
   const rels = ['package.json', 'cordis.patch.yml', 'lib/index.js', 'lib/client.js'];
+  for (const optional of ['README.md', 'LICENSE']) {
+    if (fs.existsSync(path.join(base, optional))) rels.push(optional);
+  }
   const files = {};
   for (const rel of rels) {
     files[rel] = fs.readFileSync(path.join(base, rel), 'utf8');
@@ -2259,6 +2220,110 @@ async function ensureOpenExternalPlugin(profileDir) {
   }
 }
 
+/** 删除 profile 中未受 pnpm 管理的旧插件副本；只操作 node_modules 下的精确包目录。 */
+async function removeUnmanagedProfilePackage(profileDir, packageName) {
+  const nodeModulesDir = path.resolve(profileDir, 'node_modules');
+  const packageDir = path.resolve(nodeModulesDir, packageName);
+  if (!isInsideFolder(packageDir, nodeModulesDir) || packageDir === nodeModulesDir) {
+    throw new Error(`拒绝删除 profile 外部的插件路径：${packageDir}`);
+  }
+
+  try {
+    await fs.promises.lstat(packageDir);
+  } catch (error) {
+    if (error && error.code === 'ENOENT') return false;
+    throw error;
+  }
+
+  const manifest = await readJsonFile(path.join(packageDir, 'package.json'));
+  if (!manifest || manifest.name !== packageName) {
+    throw new Error(`profile 中的 ${packageName} 不是预期插件包，已保留该目录。`);
+  }
+
+  // fs.rm 对符号链接仅移除链接本身，不递归删除其目标。
+  await fs.promises.rm(packageDir, { recursive: true, force: true });
+  return true;
+}
+
+/** 确保 DSH Cordis bridge 位于本地 bundle，并由 DSH/pnpm 正式安装到 web profile。 */
+async function ensureVscodeBridgePlugin(profileDir, forceProfileSync = false) {
+  try {
+    const files = readBundledPluginFiles(VSCODE_BRIDGE_PLUGIN_NAME);
+    const localBundle = path.join(dshHomeDir(), 'local-bundles', VSCODE_BRIDGE_PLUGIN_NAME);
+    let changed = false;
+    for (const [rel, content] of Object.entries(files)) {
+      const dest = path.join(localBundle, rel);
+      const current = await fs.promises.readFile(dest, 'utf8').catch(() => null);
+      if (current === content) continue;
+      await fs.promises.mkdir(path.dirname(dest), { recursive: true });
+      await fs.promises.writeFile(dest, content, 'utf8');
+      changed = true;
+    }
+    const dependency = `file:${path.resolve(localBundle).replace(/\\/g, '/')}`;
+    const declarationChanged = await ensureProfileDeclaration(profileDir, VSCODE_BRIDGE_PLUGIN_NAME, dependency);
+    if (declarationChanged) changed = true;
+
+    const lockFile = path.join(profileDir, 'pnpm-lock.yaml');
+    const lockBefore = await fs.promises.readFile(lockFile, 'utf8').catch(() => '');
+    const installedManifest = await readJsonFile(path.join(profileDir, 'node_modules', VSCODE_BRIDGE_PLUGIN_NAME, 'package.json'));
+    const bundledManifest = JSON.parse(files['package.json']);
+    const needsProfileSync = changed || declarationChanged || forceProfileSync ||
+      !lockBefore.includes(VSCODE_BRIDGE_PLUGIN_NAME) ||
+      !installedManifest || installedManifest.version !== bundledManifest.version;
+
+    if (!needsProfileSync) return false;
+
+    // 删除此前被扩展直接复制、但 pnpm-lock 未登记的 node_modules 副本，避免它遮蔽正式安装。
+    if (!lockBefore.includes(VSCODE_BRIDGE_PLUGIN_NAME)) {
+      if (await removeUnmanagedProfilePackage(profileDir, VSCODE_BRIDGE_PLUGIN_NAME)) changed = true;
+    }
+
+    const invocation = dshInvocation || await resolveDshInvocation();
+    if (!invocation) throw new Error('未找到可运行的 DSH CLI，无法安装 web profile 插件。');
+    const prefix = Array.isArray(invocation.prefix) ? invocation.prefix : [];
+    await runCommandOutput(invocation.cmd, [...prefix, 'plugin', '--profile', 'web', 'install'], 120000);
+
+    const listing = await runCommandOutput(
+      invocation.cmd,
+      [...prefix, 'plugin', '--profile', 'web', 'list', '--depth=0'],
+      30000,
+    );
+    if (!listing.includes(VSCODE_BRIDGE_PLUGIN_NAME)) {
+      throw new Error('DSH 插件管理器安装后仍未识别 dsh-vscode-bridge。');
+    }
+    const lockAfter = await fs.promises.readFile(lockFile, 'utf8').catch(() => '');
+    const installedAfter = await readJsonFile(path.join(profileDir, 'node_modules', VSCODE_BRIDGE_PLUGIN_NAME, 'package.json'));
+    if (!lockAfter.includes(VSCODE_BRIDGE_PLUGIN_NAME) || installedAfter?.version !== bundledManifest.version) {
+      throw new Error('DSH 插件管理器安装结果与 profile lockfile 不一致。');
+    }
+    return true;
+  } catch (e) {
+    console.error(`[DeepSeek Harness] 安装 DSH Cordis bridge ${VSCODE_BRIDGE_PLUGIN_NAME} 失败：`, e);
+    vscode.window.showWarningMessage(`安装 DSH 引用与拖放插件 ${VSCODE_BRIDGE_PLUGIN_NAME} 失败：${e.message}`);
+    return null;
+  }
+}
+
+/** 从 web profile 的启用 bundle 中停用旧专用插件，保留其依赖和文件。 */
+async function removeLegacyProfileBundles(profileDir) {
+  const pkgFile = path.join(profileDir, 'package.json');
+  const pkg = await readJsonFile(pkgFile);
+  if (!pkg) return false;
+  const legacy = new Set(['dsh-drop-caret', 'dsh-vscode-reference-sync']);
+  let changed = false;
+  const bundles = pkg.dsh && pkg.dsh.profile && pkg.dsh.profile.bundles;
+  if (Array.isArray(bundles)) {
+    const next = bundles.filter((name) => !legacy.has(name));
+    if (next.length !== bundles.length) {
+      pkg.dsh.profile.bundles = next;
+      changed = true;
+    }
+  }
+  if (!changed) return false;
+  await writeJsonFile(pkgFile, pkg);
+  return true;
+}
+
 /**
  * 工作区文件链接的点击行为配置。
  * @returns {'revealAndOpen'|'revealOnly'|'off'}
@@ -2268,27 +2333,70 @@ function fileLinkAction() {
   return FILE_LINK_ACTIONS.includes(raw) ? raw : 'revealAndOpen';
 }
 
+/** 返回当前可见的 DSH webview（编辑器标签优先）。 */
+function visibleDshTarget() {
+  if (activeTab && activeTab.visible && activeTab.webview) return activeTab;
+  if (activeView && activeView.visible && activeView.webview) return activeView;
+  return null;
+}
+
+/** 通过 DSH Cordis bridge 调用已注册插件方法；结果必须由 DSH 页面回执确认。 */
+async function sendDshPluginRequest(target, pluginId, method, payload, timeoutMs = 20000) {
+  const validIdentifier = /^[A-Za-z0-9._:-]{1,128}$/;
+  if (!validIdentifier.test(pluginId) || !validIdentifier.test(method)) {
+    throw new Error('插件 ID 或方法名格式无效。');
+  }
+  if (!target || !target.webview) throw new Error('请先打开并显示 DeepSeek Harness 对话面板。');
+
+  let serializedPayload;
+  try {
+    serializedPayload = JSON.stringify(payload === undefined ? null : payload);
+  } catch {
+    throw new Error('DSH 插件请求载荷无法序列化。');
+  }
+  if (serializedPayload.length > 1024 * 1024) throw new Error('DSH 插件请求载荷过大。');
+
+  const requestId = `vscode-plugin-${Date.now().toString(36)}-${crypto.randomBytes(12).toString('hex')}`;
+  const message = { type: 'dsh-plugin-request', requestId, pluginId, method, payload };
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (error, result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      pendingPluginRequests.delete(requestId);
+      if (error) reject(error);
+      else resolve(result);
+    };
+    const timeout = setTimeout(() => finish(new Error('等待 DSH 插件回执超时，请确认 DSH 插件已加载后重试。')), timeoutMs);
+    pendingPluginRequests.set(requestId, (response) => {
+      if (!response || response.ok !== true) {
+        finish(new Error(response && typeof response.error === 'string' ? response.error : 'DSH 插件处理失败。'));
+      } else {
+        finish(null, response.result);
+      }
+    });
+    let posted;
+    try {
+      posted = target.webview.postMessage(message);
+    } catch {
+      finish(new Error('无法向 DSH 面板发送插件请求。'));
+      return;
+    }
+    Promise.resolve(posted).then((queued) => {
+      if (!queued) finish(new Error('DSH 面板尚未就绪，请刷新面板后重试。'));
+    }, () => finish(new Error('无法向 DSH 面板发送插件请求。')));
+  });
+}
+
 /**
- * 确保 DSH web profile 已安装并声明 dsh-drop-caret 插件。
+ * 确保 DSH web profile 已声明本扩展依赖的 Cordis 插件。
  * @returns {Promise<boolean>} 本次是否发生了新增/升级安装（true 时通常需重启 dsh web 生效）。
  */
 async function ensureDshPlugins() {
   const profileDir = dshWebProfileDir();
   try {
-    const installed = await installedPluginVersion(profileDir, DSH_PLUGIN_NAME);
-    await ensureProfileDeclaration(profileDir, DSH_PLUGIN_NAME, `^${DSH_PLUGIN_MIN}`);
     let changed = false;
-    if (installed && compareVersions(installed, DSH_PLUGIN_MIN) >= 0) {
-      // dsh-drop-caret 已满足，无需安装
-    } else {
-      // 未安装或版本过低：先试官方 dsh plugin add，失败回退 npm pack。
-      const viaCli = await tryDshPluginAdd(DSH_PLUGIN_NAME);
-      if (!viaCli) {
-        await installPluginViaNpm(profileDir, DSH_PLUGIN_NAME);
-      }
-      await ensureProfileDeclaration(profileDir, DSH_PLUGIN_NAME, `^${DSH_PLUGIN_MIN}`);
-      changed = true;
-    }
     // 内置剪贴板兼容插件（文件随扩展直接写入，不走 npm）。
     // 仅在 macOS 的 VS Code webview 内嵌场景激活（DSH 页面本地判定），
     // Windows/Linux 上为惰性文件；可经 dshPanel.installClipboardPlugin 关闭。
@@ -2313,10 +2421,15 @@ async function ensureDshPlugins() {
         changed = true;
       }
     }
+    const legacyChanged = await removeLegacyProfileBundles(profileDir);
+    if (legacyChanged) changed = true;
+    const bridgeChanged = await ensureVscodeBridgePlugin(profileDir, legacyChanged);
+    if (bridgeChanged === null) return changed;
+    if (bridgeChanged) changed = true;
     return changed;
   } catch (e) {
-    console.error(`[DeepSeek Harness] 自动安装 ${DSH_PLUGIN_NAME} 失败：`, e);
-    vscode.window.showWarningMessage(`自动安装 DSH 插件 ${DSH_PLUGIN_NAME} 失败：${e.message}`);
+    console.error(`[DeepSeek Harness] 安装 DSH 配套插件失败：`, e);
+    vscode.window.showWarningMessage(`安装 DSH 配套插件失败：${e.message}`);
     return false;
   }
 }
@@ -2510,14 +2623,9 @@ function handleWebviewMessage(msg, webview) {
   } else if (msg && msg.type === 'dsh-reveal-path') {
     const token = typeof msg.token === 'string' ? msg.token.slice(0, 64) : '';
     revealWorkspaceTarget(msg, webview).catch(() => replyRevealResult(webview, token, false));
-  } else if (msg && msg.type === 'insert-selection-ack') {
-    if (msg.status === 'forwarded') {
-      vscode.window.showInformationMessage('已转发到 DSH 对话框');
-    } else if (msg.status === 'no-frame') {
-      vscode.window.showErrorMessage('转发失败：面板未加载 DSH iframe，请点「刷新」后重试');
-    } else {
-      vscode.window.showErrorMessage('转发失败：未知错误');
-    }
+  } else if (msg && msg.type === 'dsh-plugin-response' && typeof msg.requestId === 'string') {
+    const pending = pendingPluginRequests.get(msg.requestId);
+    if (pending) pending(msg);
   }
 }
 
@@ -2564,11 +2672,11 @@ async function preparePanelHtml(isTab) {
     };
   }
 
-  // 自动确保 DSH 侧配套插件 dsh-drop-caret 在位（拖文件/代码段插入对话框）。
+  // 自动部署通用 DSH Cordis bridge，旧的 drop-caret 专用插件会停用。
   const pluginInstalled = await ensureDshPlugins();
   if (pluginInstalled && (await checkUrl(getUrl()))) {
     // 服务已在运行但插件刚装上，需重启 dsh web 才加载。
-    vscode.window.showInformationMessage('已自动安装/更新 DSH 插件（dsh-drop-caret / dsh-webview-clipboard / dsh-vscode-file-links），请点击面板顶部的「重启 dsh web」使其生效。');
+    vscode.window.showInformationMessage('已部署或更新 DSH 配套插件（引用与拖放桥接），请点击面板顶部的「重启 dsh web」使其生效。');
   }
 
   const ok = await ensureRunningOnce();
@@ -4374,39 +4482,71 @@ function activate(context) {
     registerWorkspace().catch(() => {});
   });
 
-  // 发送选中内容到 DSH 对话框
+  // 对外公开的通用 Cordis 插件调用入口，供 LM Markdown 等 VS Code 扩展复用。
+  const sendPluginRequestCmd = vscode.commands.registerCommand('dshPanel.sendPluginRequest', async (request) => {
+    const pluginId = typeof request?.pluginId === 'string' ? request.pluginId : '';
+    const method = typeof request?.method === 'string' ? request.method : '';
+    if (!pluginId || !method) throw new Error('请提供 DSH 插件 ID 与方法名。');
+    const target = visibleDshTarget();
+    if (!target) throw new Error('请先打开并显示 DeepSeek Harness 对话面板。');
+    return sendDshPluginRequest(target, pluginId, method, request.payload);
+  });
+
+  // VS Code 源码右键「发送选中内容」：把多个非空选区按文件行顺序追加为引用。
   const sendSelectionCmd = vscode.commands.registerCommand('dsh.sendSelection', async () => {
     const editor = vscode.window.activeTextEditor;
-    // 发送目标：优先编辑器标签页，其次侧边栏面板。
-    const target = activeTab || activeView;
+    const target = visibleDshTarget();
     if (!editor || !target) {
-      vscode.window.showWarningMessage('请先打开 DeepSeek Harness 面板或标签页并选中代码');
+      vscode.window.showWarningMessage('请先打开并显示 DeepSeek Harness 面板，再选中源码内容。');
       return;
     }
-    const selection = editor.selection;
-    if (selection.isEmpty) {
-      vscode.window.showWarningMessage('请先选中代码片段');
-      return;
-    }
-    const document = editor.document;
-    const selectedText = document.getText(selection);
-    const filePath = document.uri.fsPath;
-    const startLine = selection.start.line + 1;
-    const endLine = selection.end.line + 1;
-    
-    const ok = await target.webview.postMessage({
-      type: 'insert-selection',
-      filePath: filePath,
-      startLine: startLine,
-      endLine: endLine,
-      content: selectedText,
-      language: document.languageId
-    });
 
-    if (ok) {
-      vscode.window.showInformationMessage('已发送选中内容到 DSH，等待面板转发…');
-    } else {
-      vscode.window.showErrorMessage('发送失败：DSH 面板 webview 未就绪，请先打开面板并等待加载完成');
+    const selections = (editor.selections || [editor.selection]).filter((selection) => selection && !selection.isEmpty);
+    if (selections.length === 0) {
+      vscode.window.showWarningMessage('请先选中一个或多个代码片段。');
+      return;
+    }
+
+    const filePath = editor.document.uri.fsPath;
+    if (!filePath) {
+      vscode.window.showWarningMessage('请先保存文件，再发送源码引用。');
+      return;
+    }
+    const ranges = [];
+    for (const selection of selections) {
+      const startLine = selection.start.line + 1;
+      // VS Code 选区的结束位置不包含 end；结束列为 0 时，末行不属于选区。
+      const endLine = selection.end.line + (selection.end.character > 0 || selection.end.line === selection.start.line ? 1 : 0);
+      if (endLine >= startLine) ranges.push({ startLine, endLine });
+    }
+    ranges.sort((left, right) => left.startLine - right.startLine || left.endLine - right.endLine);
+    const normalizedRanges = [];
+    for (const range of ranges) {
+      const previous = normalizedRanges[normalizedRanges.length - 1];
+      if (previous && range.startLine <= previous.endLine) previous.endLine = Math.max(previous.endLine, range.endLine);
+      else normalizedRanges.push({ startLine: range.startLine, endLine: range.endLine });
+    }
+    const references = normalizedRanges.map((range) => ({
+      filePath,
+      ...range,
+      language: editor.document.languageId,
+    }));
+
+    try {
+      const result = await sendDshPluginRequest(
+        target,
+        VSCODE_BRIDGE_PLUGIN_SOURCE,
+        'insertReferences',
+        { references },
+      );
+      const inserted = Number.isInteger(result?.inserted) ? result.inserted : 0;
+      if (inserted !== references.length || result?.total !== references.length) {
+        const failedIndex = Number.isInteger(result?.failedIndex) && result.failedIndex >= 0 ? result.failedIndex + 1 : 0;
+        throw new Error(`DSH 只确认插入 ${inserted}/${references.length} 个引用${failedIndex ? `；第 ${failedIndex} 个引用未插入` : ''}。`);
+      }
+      vscode.window.showInformationMessage(`已向 DSH 草稿追加 ${inserted} 个源码引用。`);
+    } catch (error) {
+      vscode.window.showErrorMessage(`发送源码引用失败：${error?.message || String(error)}`);
     }
   });
 
@@ -4425,7 +4565,7 @@ function activate(context) {
     vscode.window.showInformationMessage('已重置 DSH 会话映射：下次提问将创建新的 DSH 会话。');
   });
 
-  context.subscriptions.push(viewSub, openInTabCmd, refreshCmd, openBrowserCmd, restartCmd, wsSub, sendSelectionCmd, chatStatusCmd, diagnoseModelsCmd, resetChatCmd);
+  context.subscriptions.push(viewSub, openInTabCmd, refreshCmd, openBrowserCmd, restartCmd, wsSub, sendSelectionCmd, sendPluginRequestCmd, chatStatusCmd, diagnoseModelsCmd, resetChatCmd);
 }
 
 function deactivate() {
