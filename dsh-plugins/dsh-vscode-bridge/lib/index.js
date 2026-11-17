@@ -114,7 +114,7 @@ export function apply(ctx) {
   }
 
   ctx.effect(() => ctx.connection.fetch.register({
-    path: '/dsh-vscode-drop',
+    path: '/api/dsh-vscode-drop',
     methods: ['POST'],
     requestBody: 'streaming',
     fetch: async (request) => {
@@ -142,7 +142,7 @@ export function apply(ctx) {
   }))
 
   ctx.effect(() => ctx.connection.fetch.register({
-    path: '/dsh-vscode-path-check',
+    path: '/api/dsh-vscode-path-check',
     methods: ['POST'],
     requestBody: 'streaming',
     fetch: async (request) => {
